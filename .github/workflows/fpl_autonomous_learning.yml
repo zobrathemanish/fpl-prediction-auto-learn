@@ -1,11 +1,15 @@
-name: FPL autonomous learning
+name: FPL deadline-aware learning
 
 on:
   schedule:
-    # GitHub cron is UTC. Hourly execution is deliberate:
-    # the Python code reads the official FPL deadline and freezes snapshots
-    # at/after that deadline.
-    - cron: "17 * * * *"
+    # Once per day.
+    # 15:00 UTC = 10:00 AM Winnipeg during CDT
+    #             9:00 AM Winnipeg during CST.
+    #
+    # The Python model reads the OFFICIAL FPL deadline itself.
+    # It refreshes the upcoming snapshot only while the deadline is ahead,
+    # freezes it after the deadline, and learns completed Gameweeks.
+    - cron: "0 15 * * *"
   workflow_dispatch:
 
 permissions:
@@ -30,9 +34,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy scipy scikit-learn requests openpyxl xlsxwriter pulp
 
-      - name: Run autonomous FPL model
+      - name: Run deadline-aware FPL model
         run: |
-          python fpl_model_v13_autonomous_learning.py
+          python fpl_model_v14_deadline_aware.py
 
       - name: Persist snapshots and learned state
         run: |
@@ -42,11 +46,11 @@ jobs:
           git add fpl_snapshots/ || true
           git add fpl_gameweek_weight_history.csv || true
           git add fpl_automation_state.csv || true
-          git add fpl_model_output_v13_autonomous_learning.xlsx || true
+          git add fpl_model_output_v14_deadline_aware.xlsx || true
 
           if git diff --cached --quiet; then
             echo "No model-state changes to commit."
           else
-            git commit -m "Update FPL snapshots and learned weights"
+            git commit -m "Update FPL snapshot and learned state"
             git push
           fi
