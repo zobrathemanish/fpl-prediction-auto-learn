@@ -18,7 +18,7 @@ FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 FPL_ELEMENT_SUMMARY_URL = "https://fantasy.premierleague.com/api/element-summary/{player_id}/"
 
-OUTPUT_FILE = "fpl_model_output_v13_autonomous_learning.xlsx"
+OUTPUT_FILE = "fpl_model_output_v14_deadline_aware.xlsx"
 
 UPCOMING_FIXTURE_COUNT = 3
 N_CLUSTERS = 3
@@ -1048,24 +1048,79 @@ def fit_gameweek_weights(
 
 
 
-def get_completed_gameweeks(fixtures_df):
+def get_completed_gameweeks(
+    fixtures_df,
+    events_df=None,
+):
     """
-    Return completed FPL Gameweek numbers from the fixtures endpoint.
+    Return Gameweeks that are genuinely complete.
+
+    A Gameweek is eligible for learning only when:
+      1. it has at least one fixture,
+      2. EVERY fixture assigned to that GW has finished=True, and
+      3. when event metadata is available, FPL also marks the event finished.
+
+    This prevents learning halfway through a Gameweek.
     """
     if fixtures_df.empty or "event" not in fixtures_df.columns:
         return []
 
-    completed = (
-        fixtures_df[
-            fixtures_df["finished"] == True
-        ]["event"]
+    candidates = (
+        fixtures_df["event"]
         .dropna()
         .astype(int)
         .unique()
         .tolist()
     )
 
-    return sorted(completed)
+    completed = []
+
+    for gameweek in sorted(candidates):
+        gw_fixtures = fixtures_df[
+            fixtures_df["event"].astype("Int64") == int(gameweek)
+        ].copy()
+
+        if gw_fixtures.empty:
+            continue
+
+        fixtures_finished = (
+            gw_fixtures["finished"]
+            .fillna(False)
+            .astype(bool)
+            .all()
+        )
+
+        if not fixtures_finished:
+            continue
+
+        # If FPL event metadata is available, require FPL's own event
+        # completion flag as a second safety check.
+        if (
+            events_df is not None
+            and not events_df.empty
+            and "id" in events_df.columns
+            and "finished" in events_df.columns
+        ):
+            event_row = events_df[
+                pd.to_numeric(
+                    events_df["id"],
+                    errors="coerce",
+                ) == int(gameweek)
+            ]
+
+            if event_row.empty:
+                continue
+
+            event_finished = bool(
+                event_row.iloc[0]["finished"]
+            )
+
+            if not event_finished:
+                continue
+
+        completed.append(int(gameweek))
+
+    return completed
 
 
 def get_next_unfinished_gameweek(fixtures_df):
@@ -1210,6 +1265,112 @@ def log_automation_action(
     )
 
 
+def existing_snapshot_path(gameweek):
+    """
+    Return an existing snapshot path.
+
+    Preferred location:
+        fpl_snapshots/pre_gwN_snapshot.csv
+
+    Legacy root-level snapshots are also recognized so the already-captured
+    GW2 file is not silently ignored.
+    """
+    preferred = Path(SNAPSHOT_DIRECTORY) / (
+        f"pre_gw{int(gameweek)}_snapshot.csv"
+    )
+
+    legacy = Path(
+        f"pre_gw{int(gameweek)}_snapshot.csv"
+    )
+
+    if preferred.exists():
+        return preferred
+
+    if legacy.exists():
+        return legacy
+
+    return preferred
+
+
+def snapshot_is_pre_deadline(
+    gameweek,
+    events_df=None,
+):
+    """
+    Validate that a stored snapshot was actually saved before the official
+    deadline whenever the snapshot contains provenance metadata.
+
+    Legacy files without a snapshot_saved_utc field are allowed but logged as
+    unverified. They should be manually verified once before being trusted.
+    """
+    path = existing_snapshot_path(gameweek)
+
+    if not path.exists():
+        return False
+
+    try:
+        snapshot = pd.read_csv(path)
+    except Exception:
+        return False
+
+    if snapshot.empty:
+        return False
+
+    if "snapshot_saved_utc" not in snapshot.columns:
+        print(
+            f"GW{gameweek}: snapshot exists but has no saved-time "
+            "metadata; provenance is unverified."
+        )
+        return True
+
+    saved = pd.to_datetime(
+        snapshot["snapshot_saved_utc"].iloc[0],
+        utc=True,
+        errors="coerce",
+    )
+
+    deadline = None
+
+    if "deadline_utc" in snapshot.columns:
+        deadline = pd.to_datetime(
+            snapshot["deadline_utc"].iloc[0],
+            utc=True,
+            errors="coerce",
+        )
+
+    if (
+        (deadline is None or pd.isna(deadline))
+        and events_df is not None
+    ):
+        deadline = get_gameweek_deadline_utc(
+            events_df,
+            gameweek,
+        )
+
+    if pd.isna(saved):
+        print(
+            f"GW{gameweek}: invalid snapshot timestamp; "
+            "learning skipped."
+        )
+        return False
+
+    if deadline is None or pd.isna(deadline):
+        print(
+            f"GW{gameweek}: deadline unavailable; "
+            "snapshot provenance cannot be verified."
+        )
+        return False
+
+    if saved >= deadline:
+        print(
+            f"GW{gameweek}: REJECTED snapshot because it was saved "
+            f"at/after deadline ({saved} >= {deadline})."
+        )
+        return False
+
+    return True
+
+
 def snapshot_path(gameweek):
     directory = Path(SNAPSHOT_DIRECTORY)
     directory.mkdir(
@@ -1270,7 +1431,7 @@ def save_pre_gameweek_snapshot(
 
     This removes the need for the user to remember to save the final snapshot.
     """
-    path = snapshot_path(gameweek)
+    path = existing_snapshot_path(gameweek)
 
     if events_df is not None:
         deadline = get_gameweek_deadline_utc(
@@ -1530,16 +1691,18 @@ def learn_completed_gameweek_from_snapshot(
 
 def auto_learn_from_saved_snapshots(
     fixtures_df,
+    events_df=None,
 ):
     """
-    Learn only completed Gameweeks for which a pre-match snapshot exists.
+    Learn only genuinely completed Gameweeks with a valid PRE-GW snapshot.
 
-    Old completed GWs are NOT reconstructed from current/post-match data.
+    A GW will not be learned twice.
     """
     history = load_weight_history()
 
     completed_gameweeks = get_completed_gameweeks(
-        fixtures_df
+        fixtures_df,
+        events_df=events_df,
     )
 
     already_learned = set()
@@ -1552,12 +1715,24 @@ def auto_learn_from_saved_snapshots(
             .tolist()
         )
 
-    candidates = [
-        gw
-        for gw in completed_gameweeks
-        if gw not in already_learned
-        and snapshot_path(gw).exists()
-    ]
+    candidates = []
+
+    for gameweek in completed_gameweeks:
+        if gameweek in already_learned:
+            continue
+
+        path = existing_snapshot_path(gameweek)
+
+        if not path.exists():
+            continue
+
+        if not snapshot_is_pre_deadline(
+            gameweek,
+            events_df=events_df,
+        ):
+            continue
+
+        candidates.append(gameweek)
 
     for gameweek in candidates:
         learn_completed_gameweek_from_snapshot(
@@ -3499,7 +3674,8 @@ def main():
     if AUTO_LEARN_FROM_SAVED_SNAPSHOTS:
         weight_history = (
             auto_learn_from_saved_snapshots(
-                fixtures_df
+                fixtures_df,
+                events_df=events_df,
             )
         )
     else:
@@ -3525,6 +3701,15 @@ def main():
         )
 
         if next_gameweek is not None:
+            deadline = get_gameweek_deadline_utc(
+                events_df,
+                next_gameweek,
+            )
+            print(
+                f"Next unfinished Gameweek: GW{next_gameweek}; "
+                f"deadline={deadline}"
+            )
+
             save_pre_gameweek_snapshot(
                 players,
                 gameweek=next_gameweek,
