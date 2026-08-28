@@ -3455,6 +3455,7 @@ def main():
         players_df,
         teams_df,
         fixtures_df,
+        events_df,
     ) = get_fpl_data()
 
     players = prepare_players(
