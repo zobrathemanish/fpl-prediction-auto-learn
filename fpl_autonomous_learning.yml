@@ -1,0 +1,53 @@
+name: FPL autonomous learning
+
+on:
+  schedule:
+    # GitHub cron is UTC. Hourly execution is deliberate:
+    # the Python code reads the official FPL deadline and freezes snapshots
+    # at/after that deadline.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-fpl-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scipy scikit-learn requests openpyxl pulp
+
+      - name: Run autonomous FPL model
+        run: |
+          python fpl_model_v13_autonomous_learning.py
+
+      - name: Persist snapshots and learned state
+        run: |
+          git config user.name "fpl-learning-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add fpl_snapshots/ || true
+          git add fpl_gameweek_weight_history.csv || true
+          git add fpl_automation_state.csv || true
+          git add fpl_model_output_v13_autonomous_learning.xlsx || true
+
+          if git diff --cached --quiet; then
+            echo "No model-state changes to commit."
+          else
+            git commit -m "Update FPL snapshots and learned weights"
+            git push
+          fi
