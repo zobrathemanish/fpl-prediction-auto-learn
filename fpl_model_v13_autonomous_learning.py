@@ -212,7 +212,7 @@ def get_fpl_data():
     fixtures_df = pd.DataFrame(fixtures)
     events_df = get_bootstrap_events()
 
-    return players_df, teams_df, fixtures_df
+    return players_df, teams_df, fixtures_df, events_df
 
 
 # ============================================================
