@@ -1122,7 +1122,41 @@ def get_completed_gameweeks(
 
     return completed
 
+def get_next_future_deadline_gameweek(events_df):
+    """
+    Return the earliest Gameweek whose official deadline
+    is still in the future.
+    """
+    if (
+        events_df.empty
+        or "id" not in events_df.columns
+        or "deadline_time" not in events_df.columns
+    ):
+        return None
 
+    events = events_df.copy()
+
+    events["deadline_utc"] = pd.to_datetime(
+        events["deadline_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    future = events[
+        events["deadline_utc"] > utc_now()
+    ].copy()
+
+    if future.empty:
+        return None
+
+    future = future.sort_values(
+        "deadline_utc"
+    )
+
+    return int(
+        future.iloc[0]["id"]
+    )
+    
 def get_next_unfinished_gameweek(fixtures_df):
     """
     Return the earliest Gameweek that has at least one unfinished fixture.
@@ -1321,7 +1355,7 @@ def snapshot_is_pre_deadline(
             f"GW{gameweek}: snapshot exists but has no saved-time "
             "metadata; provenance is unverified."
         )
-        return True
+        return False
 
     saved = pd.to_datetime(
         snapshot["snapshot_saved_utc"].iloc[0],
@@ -1609,7 +1643,7 @@ def learn_completed_gameweek_from_snapshot(
     """
     Learn one completed GW ONLY from its saved pre-match snapshot.
     """
-    path = snapshot_path(
+    path = existing_snapshot_path(
         gameweek
     )
 
@@ -3696,8 +3730,8 @@ def main():
     # Save the upcoming GW snapshot only AFTER all current model
     # features have been calculated. Existing snapshots are protected.
     if AUTO_SAVE_NEXT_GW_SNAPSHOT:
-        next_gameweek = get_next_unfinished_gameweek(
-            fixtures_df
+        next_gameweek = get_next_future_deadline_gameweek(
+            events_df
         )
 
         if next_gameweek is not None:
@@ -3706,7 +3740,7 @@ def main():
                 next_gameweek,
             )
             print(
-                f"Next unfinished Gameweek: GW{next_gameweek}; "
+                f"Next future-deadline Gameweek: GW{next_gameweek}; "
                 f"deadline={deadline}"
             )
 
