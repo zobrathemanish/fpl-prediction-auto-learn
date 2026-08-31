@@ -1178,7 +1178,128 @@ def get_next_unfinished_gameweek(fixtures_df):
         .min()
     )
 
+def build_weight_gameweek_view(history):
+    """
+    Wide table showing how every learned feature weight
+    changes from one Gameweek to another.
+    """
+    if history.empty:
+        return pd.DataFrame()
 
+    view = history.pivot_table(
+        index=[
+            "Model",
+            "Position",
+            "Feature",
+        ],
+        columns="Gameweek",
+        values="Weight",
+        aggfunc="first",
+    ).reset_index()
+
+    gw_columns = [
+        column
+        for column in view.columns
+        if isinstance(column, (int, np.integer))
+    ]
+
+    view = view.rename(
+        columns={
+            gw: f"GW{gw}"
+            for gw in gw_columns
+        }
+    )
+
+    weight_columns = [
+        f"GW{gw}"
+        for gw in sorted(gw_columns)
+    ]
+
+    if weight_columns:
+        view["Mean Weight"] = (
+            view[weight_columns].mean(axis=1)
+        )
+
+        view["Median Weight"] = (
+            view[weight_columns].median(axis=1)
+        )
+
+        view["Weight Std Dev"] = (
+            view[weight_columns].std(axis=1)
+            .fillna(0.0)
+        )
+
+        view["Weight Range"] = (
+            view[weight_columns].max(axis=1)
+            - view[weight_columns].min(axis=1)
+        )
+
+    return view
+
+def build_weight_stability_view(history):
+    """
+    Show which learned features are stable
+    and which vary heavily between Gameweeks.
+    """
+    if history.empty:
+        return pd.DataFrame()
+
+    stability = (
+        history.groupby(
+            [
+                "Model",
+                "Position",
+                "Feature",
+            ],
+            as_index=False,
+        )
+        .agg(
+            Gameweeks=("Gameweek", "nunique"),
+            Mean_Weight=("Weight", "mean"),
+            Median_Weight=("Weight", "median"),
+            Std_Weight=("Weight", "std"),
+            Min_Weight=("Weight", "min"),
+            Max_Weight=("Weight", "max"),
+        )
+    )
+
+    stability["Std_Weight"] = (
+        stability["Std_Weight"]
+        .fillna(0.0)
+    )
+
+    stability["Weight_Range"] = (
+        stability["Max_Weight"]
+        - stability["Min_Weight"]
+    )
+
+    stability["Stability"] = pd.cut(
+        stability["Std_Weight"],
+        bins=[
+            -np.inf,
+            0.05,
+            0.15,
+            np.inf,
+        ],
+        labels=[
+            "Stable",
+            "Variable",
+            "Highly Variable",
+        ],
+    )
+
+    return stability.sort_values(
+        [
+            "Model",
+            "Position",
+            "Std_Weight",
+        ],
+        ascending=[
+            True,
+            True,
+            False,
+        ],
+    ).reset_index(drop=True)
 
 def get_bootstrap_events():
     """
@@ -2988,6 +3109,8 @@ def write_excel_output(
     weight_history,
     weight_summary,
     next_gw_weights,
+    weight_gameweek_view,
+    weight_stability,
 ):
     wildcard_output = build_wildcard_output(
         wildcard_squad
@@ -3346,6 +3469,20 @@ def write_excel_output(
             startrow=2,
         )
 
+        weight_gameweek_view.to_excel(
+            writer,
+            sheet_name="Weight by GW",
+            index=False,
+            startrow=2,
+        )
+        
+        weight_stability.to_excel(
+            writer,
+            sheet_name="Weight Stability",
+            index=False,
+            startrow=2,
+        )
+
         sheet_data = {
             "Summary": (
                 summary,
@@ -3398,6 +3535,14 @@ def write_excel_output(
             "Next GW Weights": (
                 next_gw_weights,
                 "NEXT GAMEWEEK ESTIMATE = RUNNING MEDIAN",
+            ),
+            "Weight by GW": (
+                weight_gameweek_view,
+                "WEIGHT VARIATION BY GAMEWEEK",
+            ),
+            "Weight Stability": (
+                weight_stability,
+                "FEATURE WEIGHT STABILITY",
             ),
         }
 
@@ -3721,6 +3866,18 @@ def main():
     ) = summarize_weight_history(
         weight_history
     )
+    
+    weight_gameweek_view = (
+        build_weight_gameweek_view(
+            weight_history
+        )
+    )
+    
+    weight_stability = (
+        build_weight_stability_view(
+            weight_history
+        )
+    )
 
     players = apply_learned_median_scores(
         players,
@@ -3812,6 +3969,8 @@ def main():
         weight_history,
         weight_summary,
         next_gw_weights,
+        weight_gameweek_view,
+        weight_stability,
     )
 
 
@@ -3875,22 +4034,21 @@ if __name__ == "__main__":
 # AUTONOMOUS DEPLOYMENT
 # ============================================================
 #
-# Run this file on a schedule (recommended: hourly).
+# Run this file automatically on a regular schedule.
 #
-# Every scheduled run is idempotent:
+# Every scheduled run:
 #
-# 1. Detect completed GWs.
-# 2. Learn any completed GW that has a valid saved pre-GW snapshot and has
-#    not already been learned.
-# 3. Detect the next unfinished GW.
-# 4. If its deadline has NOT passed, refresh that GW's snapshot.
-# 5. If its deadline HAS passed, never touch the snapshot again.
+# 1. Detect genuinely completed Gameweeks.
+# 2. Learn any completed GW that has a verified PRE-GW snapshot
+#    and has not already been learned.
+# 3. Find the earliest Gameweek whose official FPL deadline
+#    is still in the future.
+# 4. Refresh that Gameweek's snapshot while the deadline
+#    remains in the future.
+# 5. Once the deadline passes, that snapshot is frozen.
 #
-# Why refresh before deadline?
-# ----------------------------
-# If the job runs hourly, an early-week snapshot is useful as a backup, but
-# the final scheduled run before deadline automatically replaces it with the
-# freshest legal PRE-GW data. The user does not need to remember anything.
+# This means the final scheduled run before the deadline becomes
+# the freshest valid PRE-GW dataset used for later learning.
 #
-# fpl_automation_state.csv records snapshot/learning actions for auditing.
-#
+# fpl_automation_state.csv records snapshot and learning actions
+# for auditing.
